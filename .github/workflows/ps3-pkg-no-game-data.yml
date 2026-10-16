@@ -1,0 +1,207 @@
+name: Build Quake II v2.21 PS3 PKG (no game data)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quake-ii-v221-ps3-pkg-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Linux x86_64 · PS3DEV prebuilt toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install host requirements
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git make tar xz-utils
+
+      - name: Download and verify precompiled PS3DEV toolchain
+        env:
+          TOOLCHAIN_URL: https://github.com/ps3dev/ps3dev/releases/download/nightly-2026-10-12/ps3dev-linux-X64.tar.gz
+          TOOLCHAIN_SHA256: 76b1b3bc9ac260a4ece86da520225da7f2f4e334174e37b850093ff925eeb900
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ps3dev-linux-X64.tar.gz"
+          curl --fail --location --retry 3 --retry-delay 2 "$TOOLCHAIN_URL" -o "$archive"
+          echo "$TOOLCHAIN_SHA256  $archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$GITHUB_WORKSPACE"
+
+          export PS3DEV="$GITHUB_WORKSPACE/ps3dev"
+          test -x "$PS3DEV/ppu/bin/ppu-gcc"
+          test -x "$PS3DEV/spu/bin/spu-gcc"
+          test -x "$PS3DEV/bin/make_self_npdrm"
+          test -x "$PS3DEV/bin/pkg"
+          test -x "$PS3DEV/bin/package_finalize"
+          test -x "$PS3DEV/bin/sfo"
+          test -f "$PS3DEV/bin/sfo.xml"
+
+          echo "PS3DEV=$PS3DEV" >> "$GITHUB_ENV"
+          echo "PSL1GHT=$PS3DEV" >> "$GITHUB_ENV"
+          echo "PORTLIBS=$PS3DEV/portlibs/ppu" >> "$GITHUB_ENV"
+          echo "$PS3DEV/bin" >> "$GITHUB_PATH"
+          echo "$PS3DEV/ppu/bin" >> "$GITHUB_PATH"
+          echo "$PS3DEV/spu/bin" >> "$GITHUB_PATH"
+
+          "$PS3DEV/ppu/bin/ppu-gcc" --version | head -n 1
+          "$PS3DEV/spu/bin/spu-gcc" --version | head -n 1
+
+      - name: Build cgcomp for native RSX shaders
+        env:
+          PSL1GHT_REF: f649a08fd536a9e27c08c7db2d93a2d7ee4c3bbe
+          CG_URL: https://developer.download.nvidia.com/cg/Cg_3.1/Cg-3.1_April2012_x86_64.tgz
+          CG_SHA256: e8ff01e6cc38d1b3fd56a083f5860737dbd2f319a39037528fb1a74a89ae9878
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cg-3.1.tgz"
+          cgroot="$RUNNER_TEMP/cg"
+          src="$RUNNER_TEMP/PSL1GHT"
+
+          curl --fail --location --retry 3 "$CG_URL" -o "$archive"
+          echo "$CG_SHA256  $archive" | sha256sum --check -
+          mkdir -p "$cgroot"
+          tar -xzf "$archive" -C "$cgroot"
+          test -f "$cgroot/usr/lib64/libCg.so"
+          test -d "$cgroot/usr/include/Cg"
+
+          sudo install -d /usr/local/lib /usr/local/include
+          sudo install -m 0644 "$cgroot/usr/lib64/libCg.so" /usr/local/lib/libCg.so
+          sudo cp -a "$cgroot/usr/include/Cg" /usr/local/include/
+          sudo ldconfig
+
+          git clone --filter=blob:none --no-checkout https://github.com/ps3dev/PSL1GHT.git "$src"
+          git -C "$src" checkout --detach "$PSL1GHT_REF"
+          make -C "$src/tools/cgcomp"
+          install -m 0755 "$src/tools/cgcomp/cgcomp" "$PS3DEV/bin/cgcomp"
+
+          cat > "$RUNNER_TEMP/cgcomp-smoke.vcg" <<'SHADER'
+          void main(float4 p : POSITION, out float4 o : POSITION) { o = p; }
+          SHADER
+          cgcomp -v "$RUNNER_TEMP/cgcomp-smoke.vcg" "$RUNNER_TEMP/cgcomp-smoke.vpo"
+          test -s "$RUNNER_TEMP/cgcomp-smoke.vpo"
+
+      - name: Compile Quake II PS3 native RSX v2.21
+        run: |
+          set -euo pipefail
+          make -f Makefile.ps3 \
+            BUILD=build-rsx \
+            TARGET=q2ps3 \
+            PS3_NATIVE_RSX=1 \
+            PS3_CAMERA=0 \
+            PS3_V198_OSK_RECOVERY=1 \
+            PS3_FORCE_FONT_SAMPLER_PER_DRAW=1 \
+            PS3_USB_INPUT_BRIDGE=0 \
+            PS3_POLYBLEND_2D_OVERRIDE=0 \
+            PS3_SCENE_SCALE_BRIDGE=0 \
+            PS3_SAFE_VIDEO=0 \
+            -j1 2>&1 | tee "$RUNNER_TEMP/quake2-build.log"
+
+          test -s q2ps3.elf
+          file q2ps3.elf
+          sha256sum q2ps3.elf
+
+      - name: Create installable GNPDRM PKG without game data
+        run: |
+          set -euo pipefail
+          CONTENTID="UP0001-QUAKE2000_00-0000000000000000"
+          STAGE="$GITHUB_WORKSPACE/pkg-root"
+          OUT="$GITHUB_WORKSPACE/dist/Quake-II-PS3-v2.21-no-game-data.gnpdrm.pkg"
+
+          rm -rf "$STAGE" "$GITHUB_WORKSPACE/dist"
+          mkdir -p "$STAGE/USRDIR/baseq2" "$GITHUB_WORKSPACE/dist"
+
+          # NPDRM EBOOT built from this repository's source.
+          make_self_npdrm "$GITHUB_WORKSPACE/q2ps3.elf" "$STAGE/USRDIR/EBOOT.BIN" "$CONTENTID"
+
+          # Use the PS3DEV SFO template; retain the standard HDD-game category
+          # and the repository's QUAKE2000 title ID.
+          sfo --title "Quake II PS3 v2.21 (Game Data Required)" \
+              --appid "QUAKE2000" -f "$PS3DEV/bin/sfo.xml" "$STAGE/PARAM.SFO"
+          install -m 0644 branding/ICON0.PNG "$STAGE/ICON0.PNG"
+
+          cat > "$STAGE/USRDIR/baseq2/ADD-YOUR-OWN-GAME-DATA.txt" <<'NOTE'
+          Quake II PS3 v2.21 - game data not included
+
+          This package contains the PS3 executable only. It deliberately does not
+          include Quake II commercial PAK files or other copyrighted game data.
+
+          After installing the PKG, copy the legally acquired Quake II base game
+          data files (for example, pak0.pak and any other PAK files from your own
+          installation) to:
+
+            /dev_hdd0/game/QUAKE2000/USRDIR/baseq2/
+
+          Keep the directory name exactly "baseq2". The engine and the PS3
+          executable are installed separately from these files.
+          NOTE
+
+          # Hard fail if commercial game assets somehow appear in the package staging.
+          if find "$STAGE" -type f \( -iname '*.pak' -o -iname '*.pkz' -o -iname '*.dm2' \) -print -quit | grep -q .; then
+            echo "Unexpected game data found in PKG staging directory" >&2
+            exit 1
+          fi
+
+          pkg --contentid "$CONTENTID" "$STAGE/" "$OUT"
+          package_finalize "$OUT"
+          test -s "$OUT"
+
+          # Verify the finalized PKG magic, NPDRM type, and header size.
+          python3 - "$OUT" <<'PY'
+          import os
+          import struct
+          import sys
+
+          path = sys.argv[1]
+          size = os.path.getsize(path)
+          with open(path, "rb") as f:
+              header = f.read(0x80)
+          if len(header) < 0x20:
+              raise SystemExit("PKG header is truncated")
+          magic = header[:4]
+          pkg_type = struct.unpack(">I", header[4:8])[0]
+          declared_size = struct.unpack(">Q", header[0x18:0x20])[0]
+          print(f"PKG magic={magic.hex()} type=0x{pkg_type:08x} declared_size={declared_size} actual_size={size}")
+          if magic != bytes.fromhex("7f504b47"):
+              raise SystemExit("Invalid PS3 PKG magic")
+          if pkg_type != 0x80000001:
+              raise SystemExit("PKG is not finalized as NPDRM (expected type 0x80000001)")
+          if declared_size != size:
+              raise SystemExit("PKG header size does not match file size")
+          PY
+
+          file "$OUT"
+          sha256sum "$OUT"
+          cp "$RUNNER_TEMP/quake2-build.log" "$GITHUB_WORKSPACE/dist/build.log"
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "source_commit=$GITHUB_SHA"
+            echo "content_id=$CONTENTID"
+            echo "game_data_included=no"
+            echo "game_data_directory=/dev_hdd0/game/QUAKE2000/USRDIR/baseq2/"
+            printf "elf_sha256="; sha256sum q2ps3.elf | awk '{print $1}'
+            printf "pkg_sha256="; sha256sum "$OUT" | awk '{print $1}'
+          } > "$GITHUB_WORKSPACE/dist/build-info.txt"
+
+      - name: Upload GNPDRM PKG and build report
+        uses: actions/upload-artifact@v4
+        with:
+          name: quake-ii-ps3-v221-no-game-data-${{ github.sha }}
+          path: |
+            dist/Quake-II-PS3-v2.21-no-game-data.gnpdrm.pkg
+            dist/build-info.txt
+            dist/build.log
+          if-no-files-found: error
+          retention-days: 14
