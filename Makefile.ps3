@@ -265,7 +265,8 @@ CONTENTID	:=	UP0001-$(APPID)_00-0000000000000000
 #---------------------------------------------------------------------------------
 
 #CFLAGS		=	-O2 -Wall -mcpu=cell $(MACHDEP) $(INCLUDE) -D__RSX__ -DEIGEN2_SUPPORT
-CFLAGS = -O2 -Wall -std=gnu99 -mcpu=cell $(MACHDEP) $(INCLUDE) -D__PSL1GHT__ -DIOAPI_NO_64 -DYQ2OSTYPE=\"GameOS\" -DYQ2ARCH=\"PS3\" -DUNICORE
+# GCC 10+ defaults to -fno-common; the legacy Quake II tree uses common-symbol globals.
+CFLAGS = -O2 -Wall -std=gnu99 -fcommon -mcpu=cell $(MACHDEP) $(INCLUDE) -D__PSL1GHT__ -DIOAPI_NO_64 -DYQ2OSTYPE=\"GameOS\" -DYQ2ARCH=\"PS3\" -DUNICORE
 ifeq ($(PS3_NATIVE_RSX),1)
 CFLAGS += -DPS3_NATIVE_RSX
 endif
